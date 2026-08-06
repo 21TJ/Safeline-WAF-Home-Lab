@@ -1,31 +1,27 @@
-# Web Application Firewall Deployment & Attack Simulation Lab
-### Building, Attacking, and Defending a Vulnerable Web Application with SafeLine WAF
+# 🛡️ WAF Home Lab — Blocking SQL Injection with SafeLine WAF
 
-**Category:** Blue Team / Defensive Security · Home Lab Project
+I built a home lab to see, hands-on, how a Web Application Firewall actually stops an attack — not just read about it. This report documents a Kali Linux attacker VM, an Ubuntu server running a deliberately vulnerable web app (DVWA), and **SafeLine WAF** sitting in front of it as the only way in. I ran a real SQL Injection payload at it and confirmed the WAF caught and blocked it before it reached the app or database — then tested a few more of SafeLine's controls (flood defense, auth gateway, IP blocking) on top.
 
----
-
-## 1. Executive Summary
-
-This project documents the design and deployment of a self-contained cybersecurity home lab used to demonstrate how a **Web Application Firewall (WAF)** protects a vulnerable web application from common attacks. I built a two-machine virtualized environment (Kali Linux as the attacker, Ubuntu Server as the target), deployed **DVWA (Damn Vulnerable Web Application)** behind a full LAMP stack, and layered **SafeLine WAF** in front of it as a reverse proxy security control. I then simulated a real SQL Injection attack from the attacker machine and validated that the WAF detected and blocked the malicious traffic before it reached the application.
-
-The goal was to build hands-on experience with the kind of layered, defense-in-depth architecture used in real production environments — and to practice the analyst skill of reading traffic through each layer of the stack (network → web server → application → database) to understand exactly where and how an attack is stopped.
-
-**Skills demonstrated:** network segmentation, Linux server administration, web server/database configuration, DNS resolution, PKI/SSL certificate management, reverse proxy architecture, WAF policy configuration, SQL Injection testing, log analysis, and security documentation.
+The goal wasn't "install a WAF and take a screenshot." It was to actually understand the full path a request takes — network → WAF → web server → app → database — well enough that if I saw an alert like this on the job, I'd know exactly what layer stopped it and why, instead of just trusting a dashboard.
 
 ---
 
-## 2. Objective
+## Table of Contents
 
-- Deploy a vulnerable web application (DVWA) on a Linux server to act as an attack target.
-- Place a Web Application Firewall in front of the application as the sole internet-facing entry point.
-- Simulate an SQL Injection attack from an attacker machine (Kali Linux) and confirm the WAF blocks it.
-- Configure and test additional WAF security controls: HTTP flood protection, authentication gateway, and custom IP-based deny rules.
-- Document the full request lifecycle through every layer of the architecture, as a SOC analyst would need to when investigating an alert.
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Installation / Lab Setup](#installation--lab-setup)
+- [Usage — Running the Attack Simulation](#usage--running-the-attack-simulation)
+- [Results](#results)
+- [Additional WAF Controls Tested](#additional-waf-controls-tested)
+- [What I Learned](#what-i-learned)
+- [Possible Extensions](#possible-extensions)
+- [License](#license)
+- [Contact](#contact)
 
 ---
 
-## 3. Lab Architecture
+## Architecture
 
 ```
                          ┌────────────────────┐
@@ -57,109 +53,178 @@ The goal was to build hands-on experience with the kind of layered, defense-in-d
                          └────────────────────┘
 ```
 
-**Key architectural decision:** Apache was moved off port 80/443 and onto port 8080, so that SafeLine WAF could occupy the public-facing ports (80/443) and act as the single choke point for all inbound traffic. This mirrors how WAFs are deployed in production — as a reverse proxy in front of the real application server, never bypassable.
+**Key design decision:** Apache was moved off ports 80/443 and onto 8080, so SafeLine WAF could take the public-facing ports and act as the single choke point for all inbound traffic. There's no direct path to the app server from outside — every request has to go through the WAF first, the same way it would in a real production deployment.
 
-| Component | Role | Details |
-|---|---|---|
-| Kali Linux | Attacker / traffic generator | Bridged network adapter, static-mapped hostname |
-| Ubuntu Server 22.04 LTS | Target web server | LAMP stack (Apache, MySQL, PHP) |
-| DVWA | Vulnerable application | Used to safely generate real exploit traffic |
-| SafeLine WAF | Security control under test | Nginx-based reverse proxy WAF |
-| `/etc/hosts` | Local DNS resolution | Simulates domain-based access (`dvwa.local`) instead of raw IPs |
-| Self-signed SSL cert | Encryption in transit | Issued via OpenSSL, imported into SafeLine |
-
----
-
-## 4. Build Process
-
-### 4.1 Environment Setup
-- Provisioned two VirtualBox VMs (Kali Linux, Ubuntu Server 22.04 LTS) on a shared **bridged network** so both machines behaved as independent hosts on the same LAN — closer to a real network than NAT.
-- Verified Layer 3 connectivity between hosts with `ping` before proceeding.
-
-### 4.2 Target Server Build (Ubuntu)
-- Installed and configured a full **LAMP stack** (Apache2, MySQL, PHP, `php-mysql`) manually and deliberately — one component at a time — rather than a single bundled install, in order to understand each layer's specific role (web server vs. application runtime vs. database).
-- Deployed **DVWA** from source, set correct file ownership/permissions (`www-data`), and configured its database connection.
-- Seeded the database with custom test records to have realistic data to target during exploitation testing.
-
-### 4.3 Network & Name Resolution
-- Configured `/etc/hosts` on both machines to resolve `dvwa.local` to the Ubuntu server's IP, simulating enterprise-style domain-based access instead of raw IP addressing.
-- (Optional extension) Documented how a dedicated **BIND9 DNS server** would replace static host-file mappings in a larger environment.
-
-### 4.4 Port Segregation
-- Reconfigured Apache to listen on **8080** instead of 80/443, freeing the standard web ports for the WAF. This enforces that **all traffic must pass through the WAF** — there is no direct path to the application server from outside the host.
-
-### 4.5 Encryption
-- Generated a self-signed X.509 certificate with OpenSSL and imported it into SafeLine so the WAF — not Apache — terminates TLS for inbound connections.
-
-### 4.6 WAF Deployment
-- Deployed **SafeLine WAF** via its automated install script on the Ubuntu host.
-- Onboarded DVWA as a protected application inside SafeLine:
-  - Domain: `www.dvwa.local`
-  - Backend (reverse proxy target): `http://<Ubuntu_IP>:8080`
-  - Public listener: port 443 only (port 80 removed)
-  - SSL certificate attached for HTTPS termination at the WAF
+| Component | Role |
+|---|---|
+| Kali Linux | Attacker / traffic generator |
+| Ubuntu Server 22.04 LTS | Target web server |
+| DVWA | Intentionally vulnerable app, used as a safe attack target |
+| SafeLine WAF | Nginx-based reverse proxy WAF — the control being tested |
+| `/etc/hosts` | Local DNS resolution (`dvwa.local` → server IP) |
+| Self-signed SSL cert | TLS termination at the WAF |
 
 ---
 
-## 5. Attack Simulation & Detection
+## Tech Stack
 
-### 5.1 Attack
-From the Kali Linux VM, I browsed to `https://dvwa.local`, authenticated to DVWA, and set the application's security level to **Low** to allow classic SQL Injection payloads (e.g. `admin' OR '1'='1`) in the login/search fields.
+- **Virtualization:** VirtualBox
+- **Attacker OS:** Kali Linux
+- **Target OS:** Ubuntu Server 22.04 LTS
+- **Web stack:** Apache2, PHP, MySQL (LAMP)
+- **Target app:** [DVWA](https://github.com/digininja/DVWA)
+- **Security control:** [SafeLine WAF](https://waf.chaitin.com/)
+- **Encryption:** OpenSSL (self-signed cert)
 
-### 5.2 Detection & Blocking
-SafeLine WAF inspected the inbound request, matched it against its SQL Injection ruleset, and **blocked the request before it reached Apache/DVWA**. This was confirmed two ways:
-- The attacker received a WAF block/error page instead of a normal application response.
-- The **SafeLine WAF logs** showed the request flagged and blocked as a detected SQL Injection attempt, including source IP and matched signature.
+---
 
-This is the core validation of the project: a payload that would have compromised the unprotected application was neutralized purely by the WAF layer, with zero changes to the application code itself.
+## Installation / Lab Setup
 
-### 5.3 Full Request Lifecycle (as traced for this test)
+### 1. Provision the VMs
+Two VirtualBox VMs on a shared **bridged network** (so both machines act as real hosts on the LAN, not NAT):
+- `KaliLinux` — 2GB RAM, 20GB disk
+- `UbuntuServer` — 2GB RAM, 20GB disk, Ubuntu 22.04 LTS
+
+Confirm connectivity between them:
+```bash
+ping <ubuntu_ip>   # from Kali
+ping <kali_ip>     # from Ubuntu
+```
+
+### 2. Update and install base tools (Ubuntu)
+```bash
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get install -y net-tools openssl
+```
+
+### 3. Install the LAMP stack
+```bash
+sudo apt-get install -y apache2 php php-mysql mysql-server
+sudo mysql_secure_installation
+```
+
+### 4. Deploy DVWA
+```bash
+cd /var/www/html
+sudo git clone https://github.com/digininja/DVWA.git
+sudo chown -R www-data:www-data DVWA
+sudo chmod -R 755 DVWA
+```
+Edit `DVWA/config/config.inc.php` with your DB credentials, then create the database:
+```sql
+sudo mysql -u root -p
+CREATE DATABASE dvwa;
+CREATE USER 'dvwa_user'@'localhost' IDENTIFIED BY 'p@ssw0rd';
+GRANT ALL ON dvwa.* TO 'dvwa_user'@'localhost';
+FLUSH PRIVILEGES;
+```
+Then browse to `http://<ubuntu_ip>/DVWA/setup.php` and click **Create/Reset Database**.
+
+### 5. Move Apache off the public ports
+Edit `/etc/apache2/ports.conf`:
+```
+Listen 8080
+```
+Update `/etc/apache2/sites-available/000-default.conf` to `<VirtualHost *:8080>`, then:
+```bash
+sudo systemctl restart apache2
+```
+
+### 6. Set up local DNS resolution
+On **both** Kali and Ubuntu, edit `/etc/hosts`:
+```
+<ubuntu_ip>   dvwa.local
+```
+
+### 7. Generate a self-signed SSL certificate
+```bash
+sudo mkdir /etc/ssl/dvwa
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/dvwa/dvwa.key \
+  -out /etc/ssl/dvwa/dvwa.crt
+```
+
+### 8. Install SafeLine WAF
+```bash
+bash -c "$(curl -fsSLk https://waf.chaitin.com/release/latest/manager.sh)" -- --en
+```
+Log into the SafeLine UI (default port `9443`) and:
+1. Import the self-signed cert (`dvwa.crt` / `dvwa.key`).
+2. Add DVWA as a protected application:
+   - Domain: `www.dvwa.local`
+   - Backend/reverse-proxy target: `http://<ubuntu_ip>:8080`
+   - Public listener: **443 only** (remove port 80)
+
+---
+
+## Usage — Running the Attack Simulation
+
+1. On Kali, browse to `https://dvwa.local` and log in to DVWA (default: `admin` / `password`).
+2. Set the DVWA **Security Level** to `Low` (DVWA Security tab).
+3. Go to the **SQL Injection** module and submit a classic payload:
+   ```
+   admin' OR '1'='1
+   ```
+4. Instead of a normal application response, the request should be intercepted by SafeLine WAF.
+5. Check **SafeLine WAF → Logs** to confirm the request was flagged and blocked as a SQL Injection attempt, with source IP and matched rule.
+
+---
+
+## Results
+
+- The SQLi payload was **blocked at the WAF layer** — it never reached Apache, PHP, or MySQL.
+- The attacker received a WAF block page instead of a valid application response.
+- SafeLine's logs showed the blocked request with the matched detection signature and source IP.
+
 ```
 Attacker (Kali) → SafeLine WAF (443, TLS termination + inspection)
-   → [BLOCKED — malicious pattern matched, request dropped]
-```
-Versus a legitimate request:
-```
+   → BLOCKED — malicious pattern matched, request dropped
+
+Legitimate request:
 User (Kali) → SafeLine WAF (443) → Apache (8080) → PHP/DVWA
-   → MySQL (3306) → Response returns back through the same path
+   → MySQL (3306) → response returns through the same path
 ```
 
+*(Add screenshots here: the SafeLine block page, and the corresponding log entry — these are the strongest proof-of-work images for this project.)*
+
 ---
 
-## 6. Additional WAF Controls Tested
+## Additional WAF Controls Tested
 
-| Control | Purpose | Result |
+| Control | What it does | Outcome |
 |---|---|---|
-| **HTTP Flood Defense** | Rate-limit requests per source to mitigate DoS/brute-force behavior | Configured request-per-second thresholds and ban duration; validated with repeated automated requests |
-| **Authentication Gateway** | Require credentials at the WAF layer before any traffic reaches the app | Enabled; confirmed the WAF prompted for auth prior to passing traffic to DVWA |
-| **Custom Deny Rules (IP blocklisting)** | Manually block a known-malicious source | Added a deny rule matching the Kali VM's IP; confirmed subsequent requests were blocked outright |
+| **HTTP Flood Defense** | Rate-limits requests per source to mitigate DoS/brute-force | Configured request/sec thresholds + ban duration, validated with repeated requests |
+| **Authentication Gateway** | Requires credentials at the WAF before any traffic reaches the app | Confirmed WAF prompted for auth before passing traffic through |
+| **Custom Deny Rules** | Manually blocks a known-bad source IP | Blocked the Kali VM's IP directly; confirmed all further requests were denied |
 
 ---
 
-## 7. Key Takeaways / What This Demonstrates
+## What I Learned
 
-- **Defense-in-depth in practice:** the WAF acted as a compensating control that stopped a real exploitation technique (SQLi) without needing to patch or rewrite the vulnerable application — directly relevant to how SOC/security teams protect legacy or third-party apps they don't fully control.
-- **Traffic-flow analysis:** being able to trace a request end-to-end through WAF → web server → application → database is exactly the skill needed to investigate alerts and determine at which layer an attack was stopped (or wasn't).
-- **Reverse proxy security architecture:** understanding why the WAF must be the *only* internet-facing entry point (and why the app port had to be moved off 80/443) reflects real production network design.
-- **Hands-on log analysis:** validating detections directly from WAF logs rather than assuming success — a core SOC analyst habit.
-
----
-
-## 8. Possible Extensions
-
-- Add **OWASP Juice Shop** as a second target to broaden attack-surface coverage.
-- Test additional attack classes (XSS, command injection, file inclusion) against the same WAF policy.
-- Forward SafeLine WAF logs into a home SIEM (e.g., Wazuh, Splunk Free, ELK) for centralized alerting and dashboarding.
-- Integrate an NGFW/IPS in front of the WAF for a full layered perimeter.
+- A WAF can stop a real attack without touching the vulnerable app at all — DVWA never changed, the WAF just sat in front of it. That's the same situation a lot of SOC/security teams deal with when they can't patch or rewrite an app themselves.
+- Being able to trace a request through WAF → Apache → PHP → MySQL made it much easier to reason about *where* an attack was stopped, not just *that* it was stopped.
+- Moving Apache off ports 80/443 wasn't just a config step — it's what forces every request through the WAF with no bypass path. That's a real architectural decision, not a checkbox.
+- Don't trust the block page alone — I made a habit of confirming every block directly in SafeLine's logs.
 
 ---
 
-## 9. Environment / Tools Used
+## Possible Extensions
 
-- VirtualBox (virtualization)
-- Kali Linux (attacker platform)
-- Ubuntu Server 22.04 LTS (target platform)
-- Apache2, PHP, MySQL (LAMP stack)
-- DVWA (Damn Vulnerable Web Application)
-- SafeLine WAF (Nginx-based reverse proxy WAF)
-- OpenSSL (self-signed certificate generation)
+- Add [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/) as a second target for broader attack coverage.
+- Test XSS, command injection, and file inclusion against the same WAF policy.
+- Forward SafeLine logs into a home SIEM (Wazuh / Splunk Free / ELK) for centralized alerting.
+- Add an NGFW/IPS in front of the WAF for a fuller layered perimeter.
+
+---
+
+## License
+
+MIT License © 2026 [Your Name]
+
+---
+
+## Contact
+
+**[Your Name]** — Aspiring SOC Analyst
+[LinkedIn] · [Email] · [GitHub]
